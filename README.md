@@ -13,4 +13,4 @@ The project includes:
 ## Folders
 - `Code`: Contains R files for cleaning
 - `Notebooks`: Contains colab notebooks that you will need to run the models
-- `Data File`: Link and Instruction on how to download datasets
+- `Data`: Link and Instruction on how to download datasets
