@@ -1,0 +1,88 @@
+---
+title: "Clean Road Closures"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  install.packages("data.table")
+}
+if (!requireNamespace("sf", quietly = TRUE)) {
+  install.packages("sf")
+}
+library(data.table)
+library(sf)
+```
+
+```{r}
+# Paths
+input_path <- "Datasets/Street_Closures_due_to_Construction_Activities_by_Block_and_Intersection_20260121.csv"
+output_path <- "Datasets/Clean/Street_Closures_Construction_Clean.csv"
+
+# Date filter window aligned to complaints data
+min_date <- as.IDate("2006-01-01")
+max_date <- as.IDate("2024-12-31")
+
+# Columns to keep
+keep_cols <- c(
+  "OnStreetName", "FromStreetName", "ToStreetName",
+  "BoroughName", "WorkStartDate", "WorkEndDate",
+  "Purpose", "OFTCode", "WKT"
+)
+
+# Load
+dt <- fread(input_path)
+
+# Keep relevant columns if present
+keep_present <- intersect(keep_cols, names(dt))
+dt <- dt[, ..keep_present]
+
+# Drop missing/empty WKT
+dt <- dt[!is.na(WKT) & trimws(WKT) != ""]
+
+# Validate WKT geometry (drop invalid)
+geom <- tryCatch(st_as_sfc(dt$WKT), error = function(e) NULL)
+if (!is.null(geom)) {
+  valid_idx <- st_is_valid(geom)
+  dt <- dt[valid_idx]
+} else {
+  warning("WKT could not be parsed; only empty WKT rows were removed.")
+}
+
+# Parse dates
+parse_idate <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA
+  fmts <- c(
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y %b %d %I:%M:%S %p",
+    "%Y %B %d %I:%M:%S %p"
+  )
+  out <- as.Date(rep(NA, length(x)))
+  for (fmt in fmts) {
+    idx <- is.na(out) & !is.na(x)
+    if (!any(idx)) break
+    parsed <- as.Date(strptime(x[idx], fmt, tz = "America/New_York"))
+    out[idx][!is.na(parsed)] <- parsed[!is.na(parsed)]
+  }
+  as.IDate(out)
+}
+
+dt[, WorkStartDate := parse_idate(WorkStartDate)]
+dt[, WorkEndDate := parse_idate(WorkEndDate)]
+
+# If end date missing, assume same as start date
+dt[is.na(WorkEndDate) & !is.na(WorkStartDate), WorkEndDate := WorkStartDate]
+
+# Filter to date range (keep rows that overlap the window)
+dt <- dt[!is.na(WorkStartDate)]
+dt <- dt[WorkStartDate <= max_date & WorkEndDate >= min_date]
+
+# Write cleaned dataset
+fwrite(dt, output_path)
+```

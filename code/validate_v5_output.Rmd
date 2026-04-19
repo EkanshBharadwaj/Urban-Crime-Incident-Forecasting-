@@ -1,0 +1,126 @@
+---
+title: "Validate v5 Output"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+
+# Paths
+v5_script <- "Code/merge_datasets_v5.Rmd"
+point_out <- "Datasets/Clean/Combined/Updated_Crime_Enriched_PointLevel.csv"
+
+# Expected date window from v5
+expected_start <- as.Date("2006-01-01")
+expected_end   <- as.Date("2024-12-31")
+
+checks <- data.table(
+  check = character(),
+  status = character(),
+  detail = character()
+)
+
+add_check <- function(name, pass, detail) {
+  checks <<- rbind(
+    checks,
+    data.table(
+      check = name,
+      status = ifelse(isTRUE(pass), "PASS", "FAIL"),
+      detail = as.character(detail)
+    )
+  )
+}
+```
+
+```{r metadata-checks, message=FALSE, warning=FALSE}
+# 1) File existence
+script_exists <- file.exists(v5_script)
+out_exists <- file.exists(point_out)
+
+add_check("v5 script exists", script_exists, v5_script)
+add_check("output CSV exists", out_exists, point_out)
+
+if (script_exists && out_exists) {
+  s_info <- file.info(v5_script)
+  o_info <- file.info(point_out)
+
+  add_check(
+    "output newer than v5 script",
+    o_info$mtime >= s_info$mtime,
+    paste0("output mtime=", o_info$mtime, " | script mtime=", s_info$mtime)
+  )
+
+  add_check(
+    "output file non-empty",
+    is.finite(o_info$size) && o_info$size > 0,
+    paste0("size bytes=", format(o_info$size, scientific = FALSE))
+  )
+}
+```
+
+```{r data-checks, message=FALSE, warning=FALSE}
+if (out_exists) {
+  required_cols <- c(
+    "crime_date", "latitude", "longitude",
+    "closure_count_100m", "closure_dist_min", "event_count"
+  )
+
+  # Read only needed columns for speed on large files
+  dt <- fread(point_out, select = required_cols, showProgress = TRUE)
+
+  # 2) Required columns
+  missing_cols <- setdiff(required_cols, names(dt))
+  add_check(
+    "required columns present",
+    length(missing_cols) == 0,
+    if (length(missing_cols) == 0) "all present" else paste(missing_cols, collapse = ", ")
+  )
+
+  # 3) Row count
+  add_check("row count > 0", nrow(dt) > 0, paste0("rows=", nrow(dt)))
+
+  # 4) Date parse + window
+  dt[, crime_date := as.Date(crime_date)]
+  bad_date_n <- dt[is.na(crime_date), .N]
+  min_date <- dt[, suppressWarnings(min(crime_date, na.rm = TRUE))]
+  max_date <- dt[, suppressWarnings(max(crime_date, na.rm = TRUE))]
+
+  add_check("no unparseable crime_date", bad_date_n == 0, paste0("bad_date_rows=", bad_date_n))
+  add_check(
+    "crime_date within expected window",
+    isTRUE(min_date >= expected_start) && isTRUE(max_date <= expected_end),
+    paste0("min=", min_date, " | max=", max_date)
+  )
+
+  # 5) Coordinate validity
+  zero_lat_n <- dt[!is.na(latitude) & latitude == 0, .N]
+  zero_lon_n <- dt[!is.na(longitude) & longitude == 0, .N]
+
+  add_check("zero latitude count = 0", zero_lat_n == 0, paste0("zero_lat=", zero_lat_n))
+  add_check("zero longitude count = 0", zero_lon_n == 0, paste0("zero_lon=", zero_lon_n))
+
+  # 6) Enrichment sanity checks (should not all be empty/zero)
+  closure_max <- dt[, suppressWarnings(max(closure_count_100m, na.rm = TRUE))]
+  event_max <- dt[, suppressWarnings(max(event_count, na.rm = TRUE))]
+  closure_dist_nonmissing <- dt[!is.na(closure_dist_min), .N]
+
+  add_check("closure_count_100m has matches", is.finite(closure_max) && closure_max > 0, paste0("max=", closure_max))
+  add_check("event_count has matches", is.finite(event_max) && event_max > 0, paste0("max=", event_max))
+  add_check("closure_dist_min has non-missing", closure_dist_nonmissing > 0, paste0("non_missing=", closure_dist_nonmissing))
+}
+```
+
+```{r summary, echo=FALSE}
+print(checks)
+
+overall_pass <- all(checks$status == "PASS")
+cat("\n==============================\n")
+cat("VALIDATION RESULT:\n")
+cat("DONE =", ifelse(overall_pass, "YES", "NO"), "\n")
+cat("==============================\n")
+
+if (!overall_pass) {
+  cat("\nFailed checks:\n")
+  print(checks[status == "FAIL"])
+}
+```

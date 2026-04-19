@@ -1,0 +1,212 @@
+---
+title: "NYPD_Complains_Cleaning"
+author: "Ekansh Bharadwaj"
+date: "2026-01-22"
+output: pdf_document
+---
+
+
+```{r}
+library(readr); library(janitor); library(lubridate); library(dplyr); library(stringr)
+
+input_path <- "C:/Users/ekans/Desktop/DS340W/Datasets/NYPD_Complaint_Data_Historic_20260121.csv"
+
+raw_df <- read_csv(input_path, show_col_types = FALSE, col_select = c("CMPLNT_FR_DT")) %>%
+  clean_names()
+
+parsed <- suppressWarnings(mdy(raw_df$cmplnt_fr_dt))
+
+# Show the worst offenders
+bad <- tibble(raw = raw_df$cmplnt_fr_dt, parsed = parsed) %>%
+  mutate(year = year(parsed)) %>%
+  filter(!is.na(parsed) & (year < 1990 | year > year(Sys.Date()) + 1)) %>%
+  arrange(desc(year))
+
+print(head(bad, 50))
+cat("Total rows:", nrow(raw_df), "\n")
+cat("Parsed non-NA:", sum(!is.na(parsed)), "\n")
+cat("Out-of-range parsed:", nrow(bad), "\n")
+
+```
+```{r}
+# ============================
+# 01_clean_crimes.R
+# R-only cleaning + processing
+# CSV ONLY
+# Windowed daily table (2006-01-01 to 2024-12-31)
+# Fixes: insane dates caused by POSIX/ifelse coercion
+# ============================
+
+library(dplyr)
+library(lubridate)
+library(janitor)
+library(stringr)
+library(readr)
+library(tidyr)
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+input_path <- "C:/Users/ekans/Desktop/DS340W/Datasets/NYPD_Complaint_Data_Historic_20260121.csv"
+tz_nyc <- "America/New_York"
+
+# You requested this modeling window
+WINDOW_START <- as.Date("2006-01-01")
+WINDOW_END   <- as.Date("2024-12-31")
+
+# Read ONLY these columns (memory saver)
+cols_needed <- c(
+  "CMPLNT_NUM",
+  "CMPLNT_FR_DT", "CMPLNT_FR_TM",
+  "CMPLNT_TO_DT", "CMPLNT_TO_TM",
+  "ADDR_PCT_CD", "RPT_DT",
+  "KY_CD", "OFNS_DESC", "PD_DESC",
+  "CRM_ATPT_CPTD_CD", "LAW_CAT_CD",
+  "BORO_NM", "JURISDICTION_CODE", "PARKS_NM",
+  "HADEVELOPT", "HOUSING_PSA",
+  "X_COORD_CD", "Y_COORD_CD",
+  "Latitude", "Longitude",
+  "PATROL_BORO"
+)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+parse_time_hms_safe <- function(x) {
+  x <- ifelse(is.na(x) | str_trim(x) == "", NA_character_, as.character(x))
+  x <- str_trim(x)
+  x <- ifelse(x == "24:00:00", "23:59:59", x)
+  suppressWarnings(lubridate::hms(x, quiet = TRUE))
+}
+
+# -----------------------------
+# Read raw (only needed columns)
+# -----------------------------
+raw_df <- readr::read_csv(
+  input_path,
+  show_col_types = FALSE,
+  guess_max = 200000,
+  col_select = all_of(cols_needed)
+) %>%
+  janitor::clean_names()
+
+# -----------------------------
+# Clean event-level table (KEEP ALL ROWS)
+# IMPORTANT FIX:
+#   day MUST come from cmplnt_fr_dt (Date), not from POSIX conversions.
+# -----------------------------
+crimes_clean <- raw_df %>%
+  transmute(
+    cmplnt_num        = as.character(cmplnt_num),
+
+    cmplnt_fr_dt_raw  = as.character(cmplnt_fr_dt),
+    cmplnt_fr_dt      = suppressWarnings(mdy(cmplnt_fr_dt)),
+    cmplnt_fr_tm_raw  = as.character(cmplnt_fr_tm),
+    cmplnt_fr_tm      = parse_time_hms_safe(cmplnt_fr_tm),
+
+    cmplnt_to_dt_raw  = as.character(cmplnt_to_dt),
+    cmplnt_to_dt      = suppressWarnings(mdy(cmplnt_to_dt)),
+    cmplnt_to_tm_raw  = as.character(cmplnt_to_tm),
+    cmplnt_to_tm      = parse_time_hms_safe(cmplnt_to_tm),
+
+    addr_pct_cd       = as.character(addr_pct_cd),
+    rpt_dt            = suppressWarnings(mdy(rpt_dt)),
+
+    ky_cd             = suppressWarnings(as.integer(ky_cd)),
+    ofns_desc         = str_squish(toupper(as.character(ofns_desc))),
+    pd_desc           = str_squish(toupper(as.character(pd_desc))),
+
+    crm_atpt_cptd_cd  = str_squish(toupper(as.character(crm_atpt_cptd_cd))),
+    law_cat_cd        = str_squish(toupper(as.character(law_cat_cd))),
+
+    boro_nm           = str_squish(toupper(as.character(boro_nm))),
+    jurisdiction_code = as.character(jurisdiction_code),
+
+    parks_nm          = str_squish(toupper(as.character(parks_nm))),
+    hadevelopt        = str_squish(toupper(as.character(hadevelopt))),
+    housing_psa       = str_squish(toupper(as.character(housing_psa))),
+
+    x_coord_cd        = suppressWarnings(as.numeric(x_coord_cd)),
+    y_coord_cd        = suppressWarnings(as.numeric(y_coord_cd)),
+    latitude          = suppressWarnings(as.numeric(latitude)),
+    longitude         = suppressWarnings(as.numeric(longitude)),
+
+    patrol_boro       = str_squish(toupper(as.character(patrol_boro)))
+  ) %>%
+  mutate(
+    cmplnt_fr_dt = dplyr::if_else(
+      !is.na(cmplnt_fr_dt) &
+        (cmplnt_fr_dt < as.Date("1900-01-01") | cmplnt_fr_dt > Sys.Date() + 1),
+      as.Date(NA),
+      cmplnt_fr_dt
+    ),
+
+    day = cmplnt_fr_dt,
+
+    occurred_dt = as.POSIXct(cmplnt_fr_dt, tz = tz_nyc) +
+      dplyr::coalesce(cmplnt_fr_tm, lubridate::hours(0)),
+
+    day_in_window = dplyr::if_else(
+      !is.na(day) & day >= WINDOW_START & day <= WINDOW_END,
+      day,
+      as.Date(NA)
+    )
+  )
+
+# -----------------------------
+# Save event-level clean CSV (ALL ROWS)
+# -----------------------------
+out_dir <- dirname(input_path)
+clean_csv <- file.path(
+  out_dir,
+  paste0("NYPD_Complains_", format(WINDOW_START, "%Y%m%d"), "_", format(WINDOW_END, "%Y%m%d"), "_Clean.csv")
+)
+readr::write_csv(crimes_clean, clean_csv, na = "")
+
+# -----------------------------
+# Daily citywide counts in the fixed window (0-fill missing dates)
+# -----------------------------
+daily_obs <- crimes_clean %>%
+  filter(!is.na(day_in_window)) %>%
+  count(day = day_in_window, name = "crime_count")
+
+all_days <- tibble(day = seq.Date(WINDOW_START, WINDOW_END, by = "day"))
+
+daily_full <- all_days %>%
+  left_join(daily_obs, by = "day") %>%
+  mutate(crime_count = replace_na(crime_count, 0L)) %>%
+  arrange(day)
+
+daily_csv <- file.path(
+  out_dir,
+  paste0("NYPD_Complains_", format(WINDOW_START, "%Y%m%d"), "_", format(WINDOW_END, "%Y%m%d"), "_DailyCitywide.csv")
+)
+readr::write_csv(daily_full, daily_csv, na = "")
+
+# -----------------------------
+# Diagnostics / summary
+# -----------------------------
+cat("\n=== DONE ===\n")
+cat("Event-level clean CSV (all rows):\n", clean_csv, "\n", sep = "")
+cat("Daily citywide 0-filled CSV (window only):\n", daily_csv, "\n", sep = "")
+cat("Window: ", as.character(WINDOW_START), " to ", as.character(WINDOW_END), "\n", sep = "")
+cat("Total rows: ", nrow(crimes_clean), "\n", sep = "")
+cat("Rows IN window (usable for daily modeling): ", sum(!is.na(crimes_clean$day_in_window)), "\n", sep = "")
+cat("Rows outside window or invalid day: ", sum(is.na(crimes_clean$day_in_window)), "\n", sep = "")
+
+cat("\nSanity checks:\n")
+cat("cmplnt_fr_dt range (parsed): ",
+    as.character(min(crimes_clean$cmplnt_fr_dt, na.rm = TRUE)), " to ",
+    as.character(max(crimes_clean$cmplnt_fr_dt, na.rm = TRUE)), "\n", sep = "")
+cat("day range: ",
+    as.character(min(crimes_clean$day, na.rm = TRUE)), " to ",
+    as.character(max(crimes_clean$day, na.rm = TRUE)), "\n", sep = "")
+
+```
+```{r}
+str(crimes_clean$cmplnt_fr_dt)
+str(crimes_clean$day)
+
+```
+
+

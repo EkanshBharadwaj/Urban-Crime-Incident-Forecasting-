@@ -1,0 +1,653 @@
+---
+title: "Merge Cleaned Datasets v2 (Faster Chunked PLUTO Join)"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
+if (!requireNamespace("sf", quietly = TRUE)) install.packages("sf")
+if (!requireNamespace("lubridate", quietly = TRUE)) install.packages("lubridate")
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+
+library(data.table)
+library(sf)
+library(lubridate)
+library(readxl)
+```
+
+```{r}
+# ---------------------------
+# Paths / Parameters
+# ---------------------------
+tz_nyc <- "America/New_York"
+crs_target <- 2263          # NYC State Plane
+pluto_geom_crs <- 4326      # PLUTO geom is typically lon/lat WKT
+
+# Inputs
+crime_dir <- "Datasets/Clean"
+pluto_path <- "Datasets/Clean/Primary_Land_Use_Tax_Lot_Output_PLUTO_core_landuse_zoning.csv"
+closures_raw_path <- "Datasets/Street_Closures_due_to_Construction_Activities_by_Block_and_Intersection_20260121.csv"
+events_path <- "Datasets/Clean/NYC_Permitted_Events_Clean.csv"
+weather_daily_path <- "Datasets/Clean/Weather_Clean_Daily.csv"
+weather_raw_path <- "Datasets/weather.xls"
+holidays_path <- "Datasets/Clean/Holidays.csv"
+
+# Outputs (write to Clean/Combined with Updated_ prefix)
+point_out <- "Datasets/Clean/Combined/Updated_Crime_Enriched_PointLevel.csv"
+agg_out <- "Datasets/Clean/Combined/Updated_Crime_Enriched_PrecinctDaily.csv"
+
+# Matching rules
+buffer_m <- 100
+time_window_hours <- 3
+
+# Performance tuning
+pluto_chunk_size <- 200000  # adjust up/down based on RAM
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+pick_latest_file <- function(dir, pattern) {
+  files <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) stop("No matching files found: ", pattern)
+  files[which.max(file.info(files)$mtime)]
+}
+
+parse_dt_safe <- function(x, fmt = "%m/%d/%Y %H:%M:%S") {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA
+  as.POSIXct(x, format = fmt, tz = tz_nyc)
+}
+
+num_clean <- function(x) {
+  x <- gsub(",", ".", as.character(x))
+  x <- gsub("[^0-9\\.-]", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+chunk_indices <- function(n, chunk_size) {
+  split(seq_len(n), ceiling(seq_len(n) / chunk_size))
+}
+```
+
+```{r}
+# ---------------------------
+# Load crime data
+# ---------------------------
+crime_path <- "../Datasets/Clean/NYPD_Complains_20060101_20241231_Clean.csv"
+crime <- fread(crime_path)
+
+# Normalize column names (trim whitespace / hidden chars)
+setnames(crime, trimws(names(crime)))
+
+# Create crime_time
+nm <- names(crime)
+nm_low <- tolower(nm)
+col_has <- function(x) any(nm_low == tolower(x))
+col_name <- function(x) nm[which(nm_low == tolower(x))[1]]
+
+if (col_has("occurred_dt")) {
+  cd <- col_name("occurred_dt")
+  crime[, crime_time := as.POSIXct(get(cd), tz = tz_nyc)]
+} else if (col_has("cmplnt_fr_dt") && col_has("cmplnt_fr_tm")) {
+  cdt <- col_name("cmplnt_fr_dt")
+  ctm <- col_name("cmplnt_fr_tm")
+  crime[, crime_time := as.POSIXct(
+    paste(get(cdt), format(get(ctm), "%H:%M:%S")),
+    tz = tz_nyc
+  )]
+} else if (col_has("day")) {
+  cd <- col_name("day")
+  crime[, crime_time := as.POSIXct(get(cd), tz = tz_nyc)]
+} else {
+  stop("No usable time columns in crime dataset. Found columns: ", paste(nm, collapse = ", "))
+}
+
+crime[, crime_date := as.Date(crime_time)]
+crime[, row_id := .I]
+
+# Enforce analysis window and valid coordinates early
+crime <- crime[!is.na(crime_date) &
+                 crime_date >= as.Date("2006-01-01") &
+                 crime_date <= as.Date("2024-12-31")]
+crime <- crime[!is.na(latitude) & !is.na(longitude)]
+crime <- crime[latitude != 0 & longitude != 0]
+```
+
+```{r}
+# ---------------------------
+# PLUTO join (chunked point-in-polygon)
+# ---------------------------
+# Build minimal crime points for spatial join
+crime_pts <- crime[!is.na(latitude) & !is.na(longitude), .(row_id, latitude, longitude)]
+crime_pts_sf <- st_as_sf(crime_pts, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+crime_pts_sf <- st_transform(crime_pts_sf, crs_target)
+
+# Prefer cleaned PLUTO, but if it lacks geom, fall back to raw PLUTO with geom
+pluto <- fread(pluto_path)
+if (!("geom" %in% names(pluto))) {
+  message("PLUTO geom missing in cleaned file; reading raw PLUTO with geom.")
+  pluto_raw_path <- "Datasets/Primary_Land_Use_Tax_Lot_Output_(PLUTO)_20260121.csv"
+  raw_cols <- names(fread(pluto_raw_path, nrows = 0))
+
+  core_cols <- c(
+    "borough", "borocode", "Tax block", "Tax lot", "BBL",
+    "xcoord", "ycoord", "latitude", "longitude",
+    "policeprct", "council district", "community board",
+    "bct2020", "bctcb2020", "census tract 2010", "tract2010",
+    "postcode"
+  )
+
+  landuse_cols <- c(
+    "landuse", "bldgclass",
+    "lotarea", "bldgarea", "comarea", "resarea", "officearea",
+    "retailarea", "garagearea", "strgearea", "factryarea", "otherarea",
+    "numbldgs", "numfloors", "unitsres", "unitstotal",
+    "yearbuilt", "yearalter1", "yearalter2",
+    "builtfar", "residfar", "commfar", "facilfar"
+  )
+
+  zoning_cols <- c(
+    "zonedist1", "zonedist2", "zonedist3", "zonedist4",
+    "overlay1", "overlay2",
+    "spdist1", "spdist2", "spdist3",
+    "ltdheight", "splitzone"
+  )
+
+  keep_cols <- unique(c(core_cols, landuse_cols, zoning_cols, "geom"))
+  keep_cols <- intersect(keep_cols, raw_cols)
+
+  if (!("geom" %in% keep_cols)) {
+    stop("PLUTO geom column not found in raw file.")
+  }
+
+  pluto <- fread(pluto_raw_path, select = keep_cols)
+}
+
+pluto[, geom := trimws(as.character(geom))]
+pluto[geom == "", geom := NA_character_]
+pluto <- pluto[!is.na(geom)]
+
+# Some environments throw s2-related errors on WKT; disable s2 for robust parsing
+sf::sf_use_s2(FALSE)
+pluto_sf <- st_as_sf(
+  pluto,
+  wkt = "geom",
+  crs = pluto_geom_crs,
+  remove = FALSE
+)
+sf::sf_use_s2(TRUE)
+pluto_sf <- st_transform(pluto_sf, crs_target)
+
+# Chunked spatial join to reduce memory spikes
+chunks <- chunk_indices(nrow(crime_pts_sf), pluto_chunk_size)
+pluto_joined_list <- vector("list", length(chunks))
+
+for (i in seq_along(chunks)) {
+  idx <- chunks[[i]]
+  message("PLUTO join chunk ", i, "/", length(chunks), " (", length(idx), " points)")
+  joined <- st_join(crime_pts_sf[idx, ], pluto_sf, join = st_within, left = TRUE)
+  if ("landuse" %in% names(joined)) {
+    joined$landuse[is.na(joined$landuse)] <- "UNKNOWN"
+  }
+  pluto_joined_list[[i]] <- st_drop_geometry(joined)
+  rm(joined)
+  gc()
+}
+
+pluto_joined <- rbindlist(pluto_joined_list, use.names = TRUE, fill = TRUE)
+
+# Merge back to full crime table
+crime_pluto <- merge(crime, pluto_joined, by = "row_id", all.x = TRUE)
+
+# Remove duplicate lat/long columns if present
+dup_latlon <- intersect(c("latitude.x", "longitude.x", "latitude.y", "longitude.y"),
+                        names(crime_pluto))
+if (length(dup_latlon) > 0) {
+  crime_pluto[, (dup_latlon) := NULL]
+}
+```
+
+```{r}
+# ---------------------------
+# Road closures (raw, with times) -> within 100m and +/- 3 hours
+# ---------------------------
+closures <- fread(closures_raw_path)
+closures <- closures[!is.na(WKT) & trimws(WKT) != ""]
+
+# Parse datetime (format like "2016 Oct 31 12:00:00 AM")
+closures[, start_dt := as.POSIXct(WorkStartDate, format = "%Y %b %d %I:%M:%S %p", tz = tz_nyc)]
+closures[, end_dt := as.POSIXct(WorkEndDate, format = "%Y %b %d %I:%M:%S %p", tz = tz_nyc)]
+closures[is.na(end_dt) & !is.na(start_dt), end_dt := start_dt]
+
+# Geometry (coordinates appear in State Plane already)
+closures_sf <- st_as_sf(closures, wkt = "WKT", crs = crs_target, remove = FALSE)
+
+# Initialize closure features on main table
+crime_pluto[, `:=`(
+  closure_count_100m = 0L,
+  closure_dist_min = NA_real_,
+  closure_active_flag = 0L
+)]
+
+# Build sf points for spatial matching
+crime_pts2 <- crime_pluto[!is.na(latitude) & !is.na(longitude), .(row_id, crime_time, latitude, longitude)]
+crime_pts2$crime_day <- as.Date(crime_pts2$crime_time)
+crime_pts2_sf <- st_as_sf(crime_pts2, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+crime_pts2_sf <- st_transform(crime_pts2_sf, crs_target)
+
+# Compute closure features per crime (by day to limit size)
+days <- sort(unique(crime_pts2$crime_day))
+
+for (d in days) {
+  day_start <- as.POSIXct(d, tz = tz_nyc)
+  day_end <- day_start + days(1)
+
+  crimes_day <- crime_pts2_sf[crime_pts2$crime_day == d, ]
+  if (nrow(crimes_day) == 0) next
+
+  # Closures overlapping that day (broad filter)
+  clos_day <- closures_sf[!is.na(closures_sf$start_dt) &
+                            closures_sf$start_dt <= day_end &
+                            closures_sf$end_dt >= day_start, ]
+  if (nrow(clos_day) == 0) next
+
+  message("Closures day ", d, ": crimes=", nrow(crimes_day), " closures=", nrow(clos_day))
+
+  # Spatial candidates within 100m (vectorized)
+  idx_list <- st_is_within_distance(crimes_day, clos_day, dist = buffer_m)
+  if (all(lengths(idx_list) == 0)) next
+
+  crime_idx <- rep(seq_along(idx_list), lengths(idx_list))
+  clos_idx <- unlist(idx_list)
+
+  # Build candidate pairs table
+  pairs <- data.table(
+    row_id = crimes_day$row_id[crime_idx],
+    crime_time = crimes_day$crime_time[crime_idx],
+    clos_start = clos_day$start_dt[clos_idx],
+    clos_end = clos_day$end_dt[clos_idx]
+  )
+
+  # Filter by time window
+  wstart <- pairs$crime_time - hours(time_window_hours)
+  wend <- pairs$crime_time + hours(time_window_hours)
+  keep <- pairs$clos_start <= wend & pairs$clos_end >= wstart
+  if (!any(keep)) next
+
+  pairs <- pairs[keep]
+  crime_idx_keep <- crime_idx[keep]
+  clos_idx_keep <- clos_idx[keep]
+
+  # Distances for kept pairs
+  dists <- as.numeric(st_distance(
+    st_geometry(crimes_day)[crime_idx_keep],
+    st_geometry(clos_day)[clos_idx_keep],
+    by_element = TRUE
+  ))
+  pairs[, dist := dists]
+
+  # Aggregate per crime
+  agg_pairs <- pairs[, .(
+    closure_count_100m = .N,
+    closure_dist_min = min(dist, na.rm = TRUE),
+    closure_active_flag = 1L
+  ), by = row_id]
+
+  # Update main table in bulk
+  crime_pluto[agg_pairs, on = "row_id", `:=`(
+    closure_count_100m = i.closure_count_100m,
+    closure_dist_min = i.closure_dist_min,
+    closure_active_flag = i.closure_active_flag
+  )]
+}
+```
+
+```{r}
+# ---------------------------
+# Permitted events (precinct + +/- 3 hours, day-by-day)
+# ---------------------------
+events <- fread(events_path)
+events[, start_dt := as.POSIXct(`Start Date/Time`, tz = tz_nyc)]
+events[, end_dt := as.POSIXct(`End Date/Time`, tz = tz_nyc)]
+events[is.na(end_dt) & !is.na(start_dt), end_dt := start_dt]
+
+# Ensure precinct column is numeric/text compatible
+events[, precinct := as.character(`Police Precinct`)]
+crime_pluto[, precinct := as.character(addr_pct_cd)]
+
+# Initialize event features
+crime_pluto[, `:=`(event_count = 0L, has_event = 0L)]
+
+# Pre-key events for non-equi joins
+setkey(events, precinct, start_dt, end_dt)
+
+# Process day by day to reduce join size
+event_days <- sort(unique(as.Date(crime_pluto$crime_time)))
+for (d in event_days) {
+  day_start <- as.POSIXct(d, tz = tz_nyc)
+  day_end <- day_start + days(1)
+
+  crimes_day <- crime_pluto[crime_time >= day_start & crime_time < day_end &
+                              !is.na(precinct),
+                            .(row_id, precinct, crime_time)]
+  if (nrow(crimes_day) == 0) next
+
+  # Events overlapping this day (broad filter)
+  events_day <- events[!is.na(start_dt) &
+                         start_dt <= day_end & end_dt >= day_start]
+  if (nrow(events_day) == 0) next
+
+  crimes_day[, `:=`(
+    wstart = crime_time - hours(time_window_hours),
+    wend = crime_time + hours(time_window_hours)
+  )]
+
+  cand <- events_day[crimes_day,
+                     on = .(precinct, start_dt <= wend, end_dt >= wstart),
+                     nomatch = 0,
+                     allow.cartesian = TRUE]
+
+  if (nrow(cand) > 0) {
+    agg_ev <- cand[, .(event_count = .N, has_event = 1L), by = row_id]
+    crime_pluto[agg_ev, on = "row_id", `:=`(
+      event_count = i.event_count,
+      has_event = i.has_event
+    )]
+  }
+}
+```
+
+```{r}
+# ---------------------------
+# Weather: daily + nearest observation within +/- 3 hours
+# ---------------------------
+weather_daily <- fread(weather_daily_path)
+setnames(weather_daily, "date", "weather_date")
+# Ensure weather_date is a Date
+weather_daily[, weather_date := as.IDate(weather_date)]
+# Ensure no duplicate weather columns before merge (including prior .x/.y runs)
+weather_cols <- c("t_mean","t_min","t_max","rh_mean","wind_mean","at_mean","tw_mean","di_mean","obs_count")
+weather_pattern <- paste0("^(", paste(weather_cols, collapse = "|"), ")(\\..+)?$")
+# De-dup existing names to prevent data.table duplicate assignment errors
+if (anyDuplicated(names(crime_pluto))) {
+  setnames(crime_pluto, make.unique(names(crime_pluto)))
+}
+drop_cols <- unique(grep(weather_pattern, names(crime_pluto), value = TRUE))
+if (length(drop_cols) > 0) {
+  crime_pluto[, (drop_cols) := NULL]
+}
+# Guard against duplicate names inside weather_daily
+if (anyDuplicated(names(weather_daily))) {
+  setnames(weather_daily, make.unique(names(weather_daily)))
+}
+# Fast in-place join for daily weather
+setkey(weather_daily, weather_date)
+crime_pluto[weather_daily, on = .(crime_date = weather_date),
+            (weather_cols) := mget(paste0("i.", weather_cols))]
+
+# Nearest observation within +/- 3 hours from raw weather file
+read_weather <- function(path) {
+  dt <- NULL
+  dt <- tryCatch({
+    raw <- read_excel(path, col_names = FALSE)
+    as.data.table(raw)
+  }, error = function(e) NULL)
+
+  if (is.null(dt)) {
+    csv_tmp <- file.path(tempdir(), "weather_tmp.csv")
+    src <- normalizePath(path, winslash = "\\", mustWork = TRUE)
+    dst <- normalizePath(csv_tmp, winslash = "\\", mustWork = FALSE)
+    `%+%` <- function(a, b) paste0(a, b)
+    ps <- sprintf(
+      "$excel = New-Object -ComObject Excel.Application; " %+%
+        "$excel.Visible = $false; " %+%
+        "$wb = $excel.Workbooks.Open('%s'); " %+%
+        "$wb.SaveAs('%s', 6); " %+%
+        "$wb.Close($false); " %+%
+        "$excel.Quit();",
+      src,
+      dst
+    )
+    system2("powershell", args = c("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps))
+    dt <- fread(csv_tmp, header = FALSE, encoding = "UTF-8", na.strings = c("", "NA"))
+  }
+  dt
+}
+
+raw_dt <- read_weather(weather_raw_path)
+header_row <- which(grepl("^Local time", raw_dt[[1]]))[1]
+if (is.na(header_row)) stop("Could not find header row in weather file.")
+
+col_names <- as.character(unlist(raw_dt[header_row]))
+obs <- raw_dt[(header_row + 1):.N]
+setnames(obs, col_names)
+obs <- obs[, which(!is.na(names(obs)) & trimws(names(obs)) != ""), with = FALSE]
+
+old_time_col <- names(obs)[1]
+setnames(obs, old_time_col, "local_time")
+obs[, local_time := as.POSIXct(local_time, format = "%d.%m.%Y %H:%M", tz = tz_nyc)]
+obs <- obs[!is.na(local_time)]
+
+if ("T" %in% names(obs)) obs[, T := num_clean(T)] else stop("Missing T in weather file.")
+if ("U" %in% names(obs)) obs[, U := num_clean(U)] else stop("Missing U in weather file.")
+if ("Ff" %in% names(obs)) obs[, Ff := num_clean(Ff)] else obs[, Ff := NA_real_]
+
+RH <- obs$U
+T <- obs$T
+V <- obs$Ff
+
+e <- (RH / 100) * 6.105 * exp((17.2 * T) / (237.7 + T))
+AT <- 1.07 * T + 0.2 * e - 0.65 * V - 2.7
+
+a <- 0.151977
+b <- 8.313659
+c <- 1.676311
+d <- 0.00391838
+ecoef <- 0.023101
+f <- 4.68035
+
+Tw <- AT * atan(a * RH + b) + atan(AT + RH) - atan(RH - c) + d * RH^2 * atan(ecoef * RH) - f
+DI <- 0.5 * Tw + 0.5 * AT
+
+weather_obs <- obs[, .(
+  local_time,
+  t_obs = T,
+  rh_obs = U,
+  wind_obs = Ff,
+  at_obs = AT,
+  tw_obs = Tw,
+  di_obs = DI
+)]
+setkey(weather_obs, local_time)
+
+# Ensure crime_time exists for join
+if (!("crime_time" %in% names(crime_pluto))) {
+  if ("occurred_dt" %in% names(crime_pluto)) {
+    crime_pluto[, crime_time := as.POSIXct(occurred_dt, tz = tz_nyc)]
+  } else if (all(c("cmplnt_fr_dt", "cmplnt_fr_tm") %in% names(crime_pluto))) {
+    crime_pluto[, crime_time := as.POSIXct(
+      paste(cmplnt_fr_dt, format(cmplnt_fr_tm, "%H:%M:%S")),
+      tz = tz_nyc
+    )]
+  } else {
+    stop("crime_time missing and could not be reconstructed from available columns.")
+  }
+}
+
+crime_times <- crime_pluto[!is.na(crime_time), .(row_id, crime_time_i = crime_time)]
+crime_weather <- weather_obs[crime_times, on = .(local_time = crime_time_i), roll = "nearest",
+                             .(row_id = i.row_id, crime_time_i = i.crime_time_i, local_time,
+                               t_obs, rh_obs, wind_obs, at_obs, tw_obs, di_obs)]
+crime_weather[, weather_time_diff_hrs := abs(as.numeric(difftime(crime_time_i, local_time, units = "hours")))]
+
+# Enforce +/- window and blank out if no close observation
+crime_weather[weather_time_diff_hrs > time_window_hours, `:=`(
+  local_time = as.POSIXct(NA),
+  t_obs = NA_real_,
+  rh_obs = NA_real_,
+  wind_obs = NA_real_,
+  at_obs = NA_real_,
+  tw_obs = NA_real_,
+  di_obs = NA_real_
+)]
+
+# Initialize columns and join back by row_id
+crime_pluto[, `:=`(
+  weather_nearest_time = as.POSIXct(NA, tz = tz_nyc),
+  weather_time_diff_hrs = NA_real_,
+  t_nearest = NA_real_,
+  rh_nearest = NA_real_,
+  wind_nearest = NA_real_,
+  at_nearest = NA_real_,
+  tw_nearest = NA_real_,
+  di_nearest = NA_real_
+)]
+crime_pluto[crime_weather, on = "row_id", `:=`(
+  weather_nearest_time = i.local_time,
+  weather_time_diff_hrs = i.weather_time_diff_hrs,
+  t_nearest = i.t_obs,
+  rh_nearest = i.rh_obs,
+  wind_nearest = i.wind_obs,
+  at_nearest = i.at_obs,
+  tw_nearest = i.tw_obs,
+  di_nearest = i.di_obs
+)]
+```
+
+```{r}
+# ---------------------------
+# Holidays
+# ---------------------------
+hol <- fread(holidays_path)
+hol[, date := as.Date(date)]
+# Fast in-place join for holidays
+setkey(hol, date)
+holiday_cols <- setdiff(names(hol), "date")
+crime_pluto[hol, on = .(crime_date = date),
+            (holiday_cols) := mget(paste0("i.", holiday_cols))]
+```
+
+```{r}
+# ---------------------------
+# Write point-level enriched dataset
+# ---------------------------
+# Drop geometry (point coords remain as columns)
+crime_pluto_out <- crime_pluto
+
+# Final cleanup: enforce window and valid coords after joins
+crime_pluto_out <- crime_pluto_out[!is.na(crime_date) &
+                                     crime_date >= as.Date("2006-01-01") &
+                                     crime_date <= as.Date("2024-12-31")]
+crime_pluto_out <- crime_pluto_out[!is.na(latitude) & !is.na(longitude)]
+crime_pluto_out <- crime_pluto_out[latitude != 0 & longitude != 0]
+
+# Remove any lingering duplicate lat/long columns
+dup_latlon2 <- intersect(c("latitude.x", "longitude.x", "latitude.y", "longitude.y"),
+                         names(crime_pluto_out))
+if (length(dup_latlon2) > 0) {
+  crime_pluto_out[, (dup_latlon2) := NULL]
+}
+
+fwrite(crime_pluto_out, point_out)
+```
+
+```{r}
+# ---------------------------
+# Validation checks (quick)
+# ---------------------------
+key_cols <- c("crime_date", "crime_time", "latitude", "longitude")
+weather_cols <- c("t_mean","t_min","t_max","rh_mean","wind_mean","at_mean","tw_mean","di_mean","obs_count",
+                  "t_nearest","rh_nearest","wind_nearest","at_nearest","tw_nearest","di_nearest")
+holiday_cols <- c("weekend","holiday","is_christian_holiday","is_islamic_holiday","is_jewish_holiday","is_hindu_holiday")
+
+missing_report <- data.table(
+  column = c(key_cols, weather_cols, holiday_cols)
+)
+missing_report[, pct_missing := sapply(column, function(col) {
+  if (!(col %in% names(crime_pluto_out))) return(NA_real_)
+  mean(is.na(crime_pluto_out[[col]])) * 100
+})]
+
+cat("Rows:", nrow(crime_pluto_out), "\n")
+cat("Crime date range:", as.character(min(crime_pluto_out$crime_date, na.rm = TRUE)),
+    "to", as.character(max(crime_pluto_out$crime_date, na.rm = TRUE)), "\n")
+
+dup_names <- names(crime_pluto_out)[duplicated(names(crime_pluto_out))]
+if (length(dup_names) > 0) {
+  cat("Duplicate column names detected:", paste(unique(dup_names), collapse = ", "), "\n")
+} else {
+  cat("No duplicate column names detected.\n")
+}
+
+print(missing_report[order(-pct_missing)])
+
+```{r}
+# ---------------------------
+# Validation checks (merge-specific)
+# ---------------------------
+cat("Merge validation:\n")
+cat("- Rows:", nrow(crime_pluto_out), "\n")
+cat("- Crime date range:",
+    as.character(min(crime_pluto_out$crime_date, na.rm = TRUE)),
+    "to",
+    as.character(max(crime_pluto_out$crime_date, na.rm = TRUE)), "\n")
+
+# Ensure no duplicate lat/long columns
+dup_latlon_final <- intersect(c("latitude.x", "longitude.x", "latitude.y", "longitude.y"),
+                              names(crime_pluto_out))
+cat("- Duplicate lat/lon columns present:", length(dup_latlon_final) > 0, "\n")
+
+# Basic closure/event sanity
+if ("closure_count_100m" %in% names(crime_pluto_out)) {
+  cat("- closure_count_100m max:",
+      suppressWarnings(max(crime_pluto_out$closure_count_100m, na.rm = TRUE)), "\n")
+}
+if ("closure_dist_min" %in% names(crime_pluto_out)) {
+  cat("- closure_dist_min non-missing:",
+      sum(!is.na(crime_pluto_out$closure_dist_min)), "\n")
+}
+if ("event_count" %in% names(crime_pluto_out)) {
+  cat("- event_count max:",
+      suppressWarnings(max(crime_pluto_out$event_count, na.rm = TRUE)), "\n")
+}
+
+# Invalid coord check
+cat("- Zero lat count:", sum(crime_pluto_out$latitude == 0, na.rm = TRUE), "\n")
+cat("- Zero lon count:", sum(crime_pluto_out$longitude == 0, na.rm = TRUE), "\n")
+```
+
+
+```{r}
+# ---------------------------
+# Aggregate to precinct-day (baseline + extended)
+# ---------------------------
+agg <- crime_pluto_out[, .(
+  crime_count = .N,
+  closure_count_100m_mean = mean(closure_count_100m, na.rm = TRUE),
+  closure_active_rate = mean(closure_active_flag, na.rm = TRUE),
+  event_count_mean = mean(event_count, na.rm = TRUE),
+  has_event_rate = mean(has_event, na.rm = TRUE)
+), by = .(crime_date, precinct)]
+
+# Add daily weather + holidays (first value per day)
+daily_weather_cols <- c("t_mean","t_min","t_max","rh_mean","wind_mean","at_mean","tw_mean","di_mean","obs_count")
+daily_hol_cols <- c("weekend","holiday","is_christian_holiday","is_islamic_holiday","is_jewish_holiday","is_hindu_holiday")
+
+daily_join <- unique(crime_pluto_out[, c("crime_date", daily_weather_cols, daily_hol_cols), with = FALSE])
+agg <- merge(agg, daily_join, by = "crime_date", all.x = TRUE)
+
+fwrite(agg, agg_out)
+```
+
+```{r}
+cat("Point-level output:", point_out, "\n")
+cat("Precinct-daily output:", agg_out, "\n")
+```
+
+
+```{r}
+df ->read_excel("C:\\Users\\ekans\\Desktop\\DS340W\\Datasets\\Clean\\Crime_Enriched_PointLevel.csv", range = cell_rows(1:10))
+df
+
+```
+

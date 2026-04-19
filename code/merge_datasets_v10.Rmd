@@ -1,0 +1,595 @@
+---
+title: "Merge Cleaned Datasets v10 (2015-2024 + Weather/Event Rules)"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
+if (!requireNamespace("lubridate", quietly = TRUE)) install.packages("lubridate")
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+
+library(data.table)
+library(lubridate)
+library(readxl)
+```
+
+```{r}
+# ---------------------------
+# Paths / Parameters
+# ---------------------------
+base_dir <- "C:/Users/ekans/Desktop/DS340W"
+tz_nyc <- "America/New_York"
+analysis_start <- as.IDate("2015-01-01")
+analysis_end <- as.IDate("2024-12-31")
+time_window_hours <- 3
+
+crime_path <- file.path(base_dir, "Datasets", "Clean", "NYPD_Complains_20060101_20241231_Clean.csv")
+holidays_path <- file.path(base_dir, "Datasets", "Clean", "Holidays.csv")
+weather_daily_path <- file.path(base_dir, "Datasets", "Clean", "Weather_Clean_Daily.csv")
+weather_raw_path <- file.path(base_dir, "Datasets", "weather.xls")
+events_path <- file.path(base_dir, "Datasets", "Clean", "NYC_Permitted_Events_Clean.csv")
+road_closure_path <- file.path(base_dir, "Datasets", "Street_Closures_due_to_Construction_Activities_by_Block_and_Intersection_20260121.csv")
+
+point_out <- file.path(base_dir, "Datasets", "Clean", "Combined", "Updated_Crime_Enriched_PointLevel_v10.csv")
+```
+
+```{r}
+# ---------------------------
+# Helpers
+# ---------------------------
+parse_dt_multi <- function(x, fmts, tz = tz_nyc) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  out <- as.POSIXct(rep(NA, length(x)), origin = "1970-01-01", tz = tz)
+  for (fmt in fmts) {
+    idx <- is.na(out) & !is.na(x)
+    if (!any(idx)) break
+    out[idx] <- as.POSIXct(strptime(x[idx], format = fmt, tz = tz))
+  }
+  out
+}
+
+parse_time_safe <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  out <- suppressWarnings(as.ITime(x, format = "%H:%M:%S"))
+  idx <- is.na(out) & !is.na(x)
+  if (any(idx)) out[idx] <- suppressWarnings(as.ITime(x[idx], format = "%H:%M"))
+  out
+}
+
+normalize_borough <- function(x) {
+  y <- toupper(trimws(as.character(x)))
+  y[y %in% c("", "NA", "(NULL)", "NULL")] <- NA_character_
+  map <- c(
+    "MN" = "MANHATTAN", "MANHATTAN" = "MANHATTAN",
+    "BK" = "BROOKLYN", "BROOKLYN" = "BROOKLYN",
+    "QN" = "QUEENS", "QUEENS" = "QUEENS",
+    "BX" = "BRONX", "BRONX" = "BRONX",
+    "SI" = "STATEN ISLAND", "STATEN ISLAND" = "STATEN ISLAND"
+  )
+  out <- unname(map[y])
+  out[is.na(out) & !is.na(y)] <- y[is.na(out) & !is.na(y)]
+  out
+}
+
+clean_precinct <- function(x) {
+  y <- gsub("[^0-9]", "", as.character(x))
+  y[y == ""] <- NA_character_
+  y
+}
+
+expand_precinct_tokens <- function(x) {
+  x <- as.character(x)
+  if (is.na(x) || trimws(x) == "") return(NA_character_)
+  parts <- unlist(strsplit(x, "[,;/|]"))
+  parts <- trimws(parts)
+  parts <- gsub("[^0-9]", "", parts)
+  parts <- parts[parts != ""]
+  if (length(parts) == 0) return(NA_character_)
+  unique(parts)
+}
+
+safe_feature_name <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  y[y == "" | is.na(y)] <- "unknown"
+  y <- gsub("&", " and ", y, fixed = TRUE)
+  y <- gsub("[^a-z0-9]+", "_", y)
+  y <- gsub("^_+|_+$", "", y)
+  y[y == ""] <- "unknown"
+  y
+}
+
+num_clean <- function(x) {
+  y <- gsub(",", ".", as.character(x))
+  y <- gsub("[^0-9\\.-]", "", y)
+  suppressWarnings(as.numeric(y))
+}
+
+read_weather_observations <- function(path) {
+  dt <- tryCatch({
+    as.data.table(read_excel(path, col_names = FALSE))
+  }, error = function(e) NULL)
+
+  if (is.null(dt)) {
+    csv_tmp <- file.path(tempdir(), "weather_tmp_v10.csv")
+    src <- normalizePath(path, winslash = "\\", mustWork = TRUE)
+    dst <- normalizePath(csv_tmp, winslash = "\\", mustWork = FALSE)
+    ps <- sprintf(
+      "$excel = New-Object -ComObject Excel.Application; $excel.Visible = $false; $wb = $excel.Workbooks.Open('%s'); $wb.SaveAs('%s', 6); $wb.Close($false); $excel.Quit();",
+      src,
+      dst
+    )
+    system2("powershell", args = c("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps))
+    dt <- fread(csv_tmp, header = FALSE, encoding = "UTF-8", na.strings = c("", "NA"))
+  }
+
+  header_row <- which(grepl("^Local time", dt[[1]]))[1]
+  if (is.na(header_row)) stop("Could not find weather header row in weather.xls")
+
+  col_names <- as.character(unlist(dt[header_row]))
+  obs <- dt[(header_row + 1):.N]
+  setnames(obs, col_names)
+  obs <- obs[, which(!is.na(names(obs)) & trimws(names(obs)) != ""), with = FALSE]
+
+  time_col <- names(obs)[1]
+  setnames(obs, time_col, "local_time")
+  obs[, local_time := as.POSIXct(local_time, format = "%d.%m.%Y %H:%M", tz = tz_nyc)]
+  obs <- obs[!is.na(local_time)]
+
+  if (!("T" %in% names(obs))) stop("Weather raw file is missing T")
+  if (!("U" %in% names(obs))) stop("Weather raw file is missing U")
+  if (!("Ff" %in% names(obs))) obs[, Ff := NA_real_]
+
+  obs[, T := num_clean(T)]
+  obs[, U := num_clean(U)]
+  obs[, Ff := num_clean(Ff)]
+
+  RH <- obs$U
+  T <- obs$T
+  V <- obs$Ff
+
+  e <- (RH / 100) * 6.105 * exp((17.2 * T) / (237.7 + T))
+  AT <- 1.07 * T + 0.2 * e - 0.65 * V - 2.7
+
+  a <- 0.151977
+  b <- 8.313659
+  c <- 1.676311
+  d <- 0.00391838
+  ecoef <- 0.023101
+  f <- 4.68035
+
+  Tw <- AT * atan(a * RH + b) + atan(AT + RH) - atan(RH - c) + d * RH^2 * atan(ecoef * RH) - f
+  DI <- 0.5 * Tw + 0.5 * AT
+
+  out <- obs[, .(
+    local_time,
+    t_obs = T,
+    rh_obs = U,
+    wind_obs = Ff,
+    at_obs = AT,
+    tw_obs = Tw,
+    di_obs = DI
+  )]
+
+  out
+}
+```
+
+```{r}
+# ---------------------------
+# Step 1: Base complaints table (2015-01-01 to 2024-12-31)
+# ---------------------------
+crime <- fread(crime_path)
+setnames(crime, trimws(names(crime)))
+
+requested_cols <- c(
+  "cmplnt_num", "cmplnt_fr_dt", "cmplnt_fr_tm", "addr_pct_cd",
+  "ky_cd", "ofns_desc", "pd_cd", "boro_nm", "jurisdiction_code",
+  "parks_nm", "lat_lon", "patrol_boro"
+)
+
+# Keep requested columns if present; pd_cd/lat_lon may not exist in cleaned file
+keep_cols <- intersect(requested_cols, names(crime))
+missing_cols <- setdiff(requested_cols, keep_cols)
+if (length(missing_cols) > 0) {
+  message("Requested complaint columns not found (kept script running): ",
+          paste(missing_cols, collapse = ", "))
+}
+crime <- crime[, ..keep_cols]
+
+# Parse date/time and enforce range
+crime[, cmplnt_fr_dt := as.IDate(cmplnt_fr_dt)]
+crime[, cmplnt_fr_tm := parse_time_safe(cmplnt_fr_tm)]
+crime[, crime_date := cmplnt_fr_dt]
+# Build datetime robustly from date + seconds since midnight.
+# This avoids parse failures from non-standard time strings or NA times.
+crime[, crime_time := as.POSIXct(crime_date, tz = tz_nyc) +
+                  fifelse(is.na(cmplnt_fr_tm), 0, as.integer(cmplnt_fr_tm))]
+crime <- crime[!is.na(crime_date) & crime_date >= analysis_start & crime_date <= analysis_end]
+
+# Add one synthetic row for each day with no complaint
+all_days <- data.table(crime_date = seq(analysis_start, analysis_end, by = "day"))
+present_days <- unique(crime[, .(crime_date)])
+missing_days <- all_days[!present_days, on = "crime_date"]
+
+crime[, synthetic_no_crime_row := 0L]
+if (nrow(missing_days) > 0) {
+  no_crime <- data.table(crime_date = missing_days$crime_date)
+  for (nm in setdiff(names(crime), c("crime_date", "crime_time", "cmplnt_fr_dt", "cmplnt_fr_tm", "synthetic_no_crime_row"))) {
+    if (is.numeric(crime[[nm]]) || is.integer(crime[[nm]])) {
+      no_crime[, (nm) := 0]
+    } else {
+      no_crime[, (nm) := NA_character_]
+    }
+  }
+
+  if ("cmplnt_num" %in% names(no_crime)) no_crime[, cmplnt_num := 0]
+  if ("ky_cd" %in% names(no_crime)) no_crime[, ky_cd := 0]
+  if ("ofns_desc" %in% names(no_crime)) no_crime[, ofns_desc := "NO_CRIME_RECORDED"]
+
+  no_crime[, cmplnt_fr_dt := crime_date]
+  no_crime[, cmplnt_fr_tm := as.ITime("00:00:00")]
+  no_crime[, crime_time := as.POSIXct(paste(crime_date, "00:00:00"), tz = tz_nyc)]
+  no_crime[, synthetic_no_crime_row := 1L]
+
+  crime <- rbindlist(list(crime, no_crime), use.names = TRUE, fill = TRUE)
+}
+
+setorder(crime, crime_date, crime_time)
+crime[, row_id := .I]
+cat("Rows after Step 1:", nrow(crime), "\n")
+cat("Synthetic no-crime rows added:", sum(crime$synthetic_no_crime_row == 1L), "\n")
+```
+
+```{r}
+# ---------------------------
+# Step 2: Merge holidays (daily, full coverage expected)
+# ---------------------------
+holidays <- fread(holidays_path)
+holidays[, date := as.IDate(date)]
+setkey(holidays, date)
+
+holiday_cols <- setdiff(names(holidays), "date")
+crime[holidays, on = .(crime_date = date), (holiday_cols) := mget(paste0("i.", holiday_cols))]
+
+# Defensive fill if any date was unexpectedly missing in holidays
+for (col in holiday_cols) {
+  if (is.numeric(crime[[col]]) || is.integer(crime[[col]])) {
+    crime[is.na(get(col)), (col) := 0]
+  }
+}
+```
+
+```{r}
+# ---------------------------
+# Step 3: Merge weather
+# Rule: nearest same-day obs within +/-3 hours; otherwise avg(prev day, next day)
+# ---------------------------
+weather_daily <- fread(weather_daily_path)
+weather_daily[, date := as.IDate(date)]
+weather_daily <- weather_daily[
+  date >= analysis_start & date <= analysis_end,
+  .(
+    t_mean = mean(t_mean, na.rm = TRUE),
+    t_min = mean(t_min, na.rm = TRUE),
+    t_max = mean(t_max, na.rm = TRUE),
+    rh_mean = mean(rh_mean, na.rm = TRUE),
+    wind_mean = mean(wind_mean, na.rm = TRUE),
+    at_mean = mean(at_mean, na.rm = TRUE),
+    tw_mean = mean(tw_mean, na.rm = TRUE),
+    di_mean = mean(di_mean, na.rm = TRUE),
+    obs_count = mean(obs_count, na.rm = TRUE)
+  ),
+  by = date
+]
+setkey(weather_daily, date)
+
+# Keep daily weather too (helpful for QA)
+crime[weather_daily, on = .(crime_date = date), `:=`(
+  t_mean = i.t_mean,
+  t_min = i.t_min,
+  t_max = i.t_max,
+  rh_mean = i.rh_mean,
+  wind_mean = i.wind_mean,
+  at_mean = i.at_mean,
+  tw_mean = i.tw_mean,
+  di_mean = i.di_mean,
+  obs_count = i.obs_count
+)]
+
+# Nearest observation on same day within +/-3h
+weather_obs <- read_weather_observations(weather_raw_path)
+setkey(weather_obs, local_time)
+
+crime_idx <- crime[!is.na(crime_time), .(row_id, crime_time, crime_date)]
+nearest_obs <- weather_obs[crime_idx, on = .(local_time = crime_time), roll = "nearest",
+  .(
+    row_id = i.row_id,
+    crime_time = i.crime_time,
+    weather_obs_time = local_time,
+    t_obs, rh_obs, wind_obs, at_obs, tw_obs, di_obs
+  )
+]
+nearest_obs[, weather_diff_hours := abs(as.numeric(difftime(crime_time, weather_obs_time, units = "hours")))]
+nearest_obs[, same_day := as.IDate(crime_time) == as.IDate(weather_obs_time)]
+
+nearest_obs[!(same_day & weather_diff_hours <= time_window_hours), `:=`(
+  weather_obs_time = as.POSIXct(NA, origin = "1970-01-01", tz = tz_nyc),
+  t_obs = NA_real_, rh_obs = NA_real_, wind_obs = NA_real_,
+  at_obs = NA_real_, tw_obs = NA_real_, di_obs = NA_real_,
+  weather_diff_hours = NA_real_
+)]
+
+crime[, `:=`(
+  weather_obs_time = as.POSIXct(NA, origin = "1970-01-01", tz = tz_nyc),
+  weather_diff_hours = NA_real_,
+  t_weather = NA_real_, rh_weather = NA_real_, wind_weather = NA_real_,
+  at_weather = NA_real_, tw_weather = NA_real_, di_weather = NA_real_,
+  weather_source = NA_character_
+)]
+
+crime[nearest_obs, on = "row_id", `:=`(
+  weather_obs_time = i.weather_obs_time,
+  weather_diff_hours = i.weather_diff_hours,
+  t_weather = i.t_obs,
+  rh_weather = i.rh_obs,
+  wind_weather = i.wind_obs,
+  at_weather = i.at_obs,
+  tw_weather = i.tw_obs,
+  di_weather = i.di_obs
+)]
+
+# Fallback: average of previous and next day daily weather
+prev_daily <- weather_daily[crime[, .(row_id, crime_date)], on = .(date < crime_date), mult = "last",
+  .(row_id = i.row_id,
+    p_t = t_mean, p_rh = rh_mean, p_wind = wind_mean, p_at = at_mean, p_tw = tw_mean, p_di = di_mean)]
+next_daily <- weather_daily[crime[, .(row_id, crime_date)], on = .(date > crime_date), mult = "first",
+  .(row_id = i.row_id,
+    n_t = t_mean, n_rh = rh_mean, n_wind = wind_mean, n_at = at_mean, n_tw = tw_mean, n_di = di_mean)]
+
+fallback <- merge(prev_daily, next_daily, by = "row_id", all = TRUE)
+fallback[, `:=`(
+  t_fb = (p_t + n_t) / 2,
+  rh_fb = (p_rh + n_rh) / 2,
+  wind_fb = (p_wind + n_wind) / 2,
+  at_fb = (p_at + n_at) / 2,
+  tw_fb = (p_tw + n_tw) / 2,
+  di_fb = (p_di + n_di) / 2
+)]
+
+crime[fallback, on = "row_id", `:=`(
+  t_weather = fifelse(is.na(t_weather), i.t_fb, t_weather),
+  rh_weather = fifelse(is.na(rh_weather), i.rh_fb, rh_weather),
+  wind_weather = fifelse(is.na(wind_weather), i.wind_fb, wind_weather),
+  at_weather = fifelse(is.na(at_weather), i.at_fb, at_weather),
+  tw_weather = fifelse(is.na(tw_weather), i.tw_fb, tw_weather),
+  di_weather = fifelse(is.na(di_weather), i.di_fb, di_weather)
+)]
+
+crime[!is.na(weather_obs_time), weather_source := "nearest_same_day_within_3h"]
+crime[is.na(weather_source) & !is.na(t_weather), weather_source := "avg_prev_next_day"]
+crime[is.na(weather_source), weather_source := "missing"]
+```
+
+```{r}
+# ---------------------------
+# Step 4: Merge events
+# Rule: same borough + same precinct + event start/end within crime +/-3h
+# Output: one-hot columns for event type and street closure type
+# ---------------------------
+events <- fread(
+  events_path,
+  select = c("Event Name", "Start Date/Time", "End Date/Time", "Event Type", "Event Borough", "Street Closure Type", "Police Precinct")
+)
+
+# Parse event datetimes (clean file can contain UTC-like or local formats)
+iso_start <- suppressWarnings(with_tz(ymd_hms(events[["Start Date/Time"]], tz = "UTC", quiet = TRUE), tz_nyc))
+iso_end <- suppressWarnings(with_tz(ymd_hms(events[["End Date/Time"]], tz = "UTC", quiet = TRUE), tz_nyc))
+
+fallback_start <- parse_dt_multi(events[["Start Date/Time"]], c(
+  "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"
+))
+fallback_end <- parse_dt_multi(events[["End Date/Time"]], c(
+  "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"
+))
+
+events[, event_start := iso_start]
+events[is.na(event_start), event_start := fallback_start[is.na(event_start)]]
+events[, event_end := iso_end]
+events[is.na(event_end), event_end := fallback_end[is.na(event_end)]]
+events[is.na(event_end) & !is.na(event_start), event_end := event_start]
+
+# Swap bad ranges
+swap_idx <- !is.na(events$event_start) & !is.na(events$event_end) & events$event_end < events$event_start
+if (any(swap_idx)) {
+  tmp <- events$event_start[swap_idx]
+  events$event_start[swap_idx] <- events$event_end[swap_idx]
+  events$event_end[swap_idx] <- tmp
+}
+
+events <- events[!is.na(event_start) & as.IDate(event_start) <= analysis_end & as.IDate(event_end) >= analysis_start]
+events[, event_borough_norm := normalize_borough(`Event Borough`)]
+events[, precinct_raw := as.character(`Police Precinct`)]
+events[, event_type_clean := safe_feature_name(`Event Type`)]
+events[, closure_type_clean := safe_feature_name(`Street Closure Type`)]
+
+# Expand multi-precinct rows
+events[, event_id := .I]
+prec_exp <- events[, .(crime_precinct = expand_precinct_tokens(precinct_raw)), by = event_id]
+events <- merge(
+  events[, !c("precinct_raw"), with = FALSE],
+  prec_exp,
+  by = "event_id",
+  all.x = TRUE
+)
+events[, event_id := NULL]
+events[, crime_precinct := clean_precinct(crime_precinct)]
+events <- events[!is.na(event_borough_norm) & !is.na(crime_precinct)]
+
+# Prepare crime keys
+crime[, crime_borough_norm := normalize_borough(boro_nm)]
+crime[, crime_precinct := clean_precinct(addr_pct_cd)]
+crime[, `:=`(
+  wstart = crime_time - hours(time_window_hours),
+  wend = crime_time + hours(time_window_hours)
+)]
+
+crime_evt <- crime[!is.na(crime_time) & !is.na(crime_borough_norm) & !is.na(crime_precinct),
+  .(row_id, crime_date, crime_borough_norm, crime_precinct, wstart, wend)
+]
+
+# Initialize event outputs
+crime[, `:=`(event_match_count = 0L, has_event = 0L)]
+
+all_event_type_cols <- paste0("event_type_", sort(unique(events$event_type_clean)))
+all_closure_type_cols <- paste0("event_closure_type_", sort(unique(events$closure_type_clean)))
+for (cn in c(all_event_type_cols, all_closure_type_cols)) {
+  crime[, (cn) := 0L]
+}
+
+# Day-by-day matching keeps memory bounded for very large event files.
+setkey(events, event_borough_norm, crime_precinct, event_start, event_end)
+event_days <- sort(unique(crime_evt$crime_date))
+
+for (d in event_days) {
+  day_start <- as.POSIXct(d, tz = tz_nyc)
+  day_end <- day_start + days(1)
+
+  crimes_day <- crime_evt[crime_date == d]
+  if (nrow(crimes_day) == 0) next
+
+  events_day <- events[event_start <= day_end & event_end >= day_start]
+  if (nrow(events_day) == 0) next
+
+  cand <- events_day[crimes_day,
+    on = .(
+      event_borough_norm = crime_borough_norm,
+      crime_precinct,
+      event_start <= wend,
+      event_end >= wstart
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ]
+
+  if (nrow(cand) == 0) next
+
+  cand <- cand[
+    (event_start >= wstart & event_start <= wend) |
+      (event_end >= wstart & event_end <= wend)
+  ]
+  if (nrow(cand) == 0) next
+
+  cnt <- cand[, .(event_match_count = .N), by = row_id]
+  crime[cnt, on = "row_id", `:=`(
+    event_match_count = pmax(event_match_count, i.event_match_count),
+    has_event = 1L
+  )]
+
+  feature_hits <- rbindlist(list(
+    unique(cand[, .(row_id, feature = paste0("event_type_", event_type_clean))]),
+    unique(cand[, .(row_id, feature = paste0("event_closure_type_", closure_type_clean))])
+  ))
+  if (nrow(feature_hits) > 0) {
+    feature_hits[, value := 1L]
+    feature_wide <- dcast(feature_hits, row_id ~ feature, value.var = "value", fill = 0L, fun.aggregate = max)
+    feat_cols <- setdiff(names(feature_wide), "row_id")
+    crime[feature_wide, on = "row_id", (feat_cols) := mget(paste0("i.", feat_cols))]
+    for (cn in feat_cols) {
+      crime[is.na(get(cn)), (cn) := 0L]
+    }
+  }
+}
+
+crime[, c("wstart", "wend") := NULL]
+```
+
+```{r}
+# ---------------------------
+# Step 5: Road closure dataset (construction closures)
+# Rule used: same borough + closure overlaps crime +/-3h
+# ---------------------------
+closures <- fread(
+  road_closure_path,
+  select = c("BoroughName", "WorkStartDate", "WorkEndDate", "Purpose", "OFTCode")
+)
+
+closures[, close_start := parse_dt_multi(WorkStartDate, c(
+  "%Y %b %d %I:%M:%S %p", "%Y %b %d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"
+))]
+closures[, close_end := parse_dt_multi(WorkEndDate, c(
+  "%Y %b %d %I:%M:%S %p", "%Y %b %d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"
+))]
+closures[is.na(close_end) & !is.na(close_start), close_end := close_start]
+closures[, close_borough_norm := normalize_borough(BoroughName)]
+
+swap_close <- !is.na(closures$close_start) & !is.na(closures$close_end) & closures$close_end < closures$close_start
+if (any(swap_close)) {
+  tmp <- closures$close_start[swap_close]
+  closures$close_start[swap_close] <- closures$close_end[swap_close]
+  closures$close_end[swap_close] <- tmp
+}
+
+closures <- closures[!is.na(close_start) & !is.na(close_borough_norm)]
+closures <- closures[as.IDate(close_start) <= analysis_end & as.IDate(close_end) >= analysis_start]
+
+crime[, `:=`(
+  rc_wstart = crime_time - hours(time_window_hours),
+  rc_wend = crime_time + hours(time_window_hours)
+)]
+crime_rc <- crime[!is.na(crime_time) & !is.na(crime_borough_norm),
+  .(row_id, crime_date, crime_borough_norm, rc_wstart, rc_wend)
+]
+
+crime[, `:=`(road_closure_count = 0L, has_road_closure = 0L)]
+setkey(closures, close_borough_norm, close_start, close_end)
+closure_days <- sort(unique(crime_rc$crime_date))
+
+for (d in closure_days) {
+  day_start <- as.POSIXct(d, tz = tz_nyc)
+  day_end <- day_start + days(1)
+
+  crimes_day <- crime_rc[crime_date == d]
+  if (nrow(crimes_day) == 0) next
+
+  closures_day <- closures[close_start <= day_end & close_end >= day_start]
+  if (nrow(closures_day) == 0) next
+
+  rc_cand <- closures_day[crimes_day,
+    on = .(
+      close_borough_norm = crime_borough_norm,
+      close_start <= rc_wend,
+      close_end >= rc_wstart
+    ),
+    nomatch = 0,
+    allow.cartesian = TRUE
+  ]
+  if (nrow(rc_cand) == 0) next
+
+  rc_cnt <- rc_cand[, .(road_closure_count = .N), by = row_id]
+  crime[rc_cnt, on = "row_id", `:=`(
+    road_closure_count = pmax(road_closure_count, i.road_closure_count),
+    has_road_closure = 1L
+  )]
+}
+
+crime[, c("rc_wstart", "rc_wend") := NULL]
+```
+
+```{r}
+# ---------------------------
+# Final output + quick checks
+# ---------------------------
+setorder(crime, crime_date, crime_time, row_id)
+fwrite(crime, point_out)
+
+cat("Output:", point_out, "\n")
+cat("Rows:", nrow(crime), "\n")
+cat("Date range:", as.character(min(crime$crime_date, na.rm = TRUE)), "to", as.character(max(crime$crime_date, na.rm = TRUE)), "\n")
+cat("Synthetic no-crime rows:", sum(crime$synthetic_no_crime_row == 1L, na.rm = TRUE), "\n")
+cat("Rows with event matches:", sum(crime$has_event == 1L, na.rm = TRUE), "\n")
+cat("Rows with road closure matches:", sum(crime$has_road_closure == 1L, na.rm = TRUE), "\n")
+cat("Weather source counts:\n")
+print(crime[, .N, by = weather_source][order(-N)])
+```

@@ -1,0 +1,99 @@
+---
+title: "Clean Permitted Events"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  install.packages("data.table")
+}
+library(data.table)
+```
+
+```{r}
+# Paths
+input_path <- "Datasets/NYC_Permitted_Event_Information_-_Historical_20260121.csv"
+output_path <- "Datasets/Clean/NYC_Permitted_Events_Clean.csv"
+
+# Date filter window aligned to complaints data
+min_date <- as.IDate("2006-01-01")
+max_date <- as.IDate("2024-12-31")
+
+# Columns to keep (no Event ID, per request)
+keep_cols <- c(
+  "Event Name",
+  "Start Date/Time",
+  "End Date/Time",
+  "Event Agency",
+  "Event Type",
+  "Event Borough",
+  "Event Location",
+  "Event Street Side",
+  "Street Closure Type",
+  "Community Board",
+  "Police Precinct"
+)
+
+# Load
+dt <- fread(input_path)
+
+# Keep relevant columns if present
+keep_present <- intersect(keep_cols, names(dt))
+dt <- dt[, ..keep_present]
+
+# Parse datetimes robustly
+parse_dt <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA
+  fmts <- c(
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y",
+    "%Y-%m-%d",
+    "%Y %b %d %I:%M:%S %p",
+    "%Y %B %d %I:%M:%S %p"
+  )
+  out <- as.POSIXct(rep(NA, length(x)), tz = "America/New_York")
+  for (fmt in fmts) {
+    idx <- is.na(out) & !is.na(x)
+    if (!any(idx)) break
+    parsed <- as.POSIXct(strptime(x[idx], fmt, tz = "America/New_York"))
+    out[idx][!is.na(parsed)] <- parsed[!is.na(parsed)]
+  }
+  out
+}
+
+dt[, `Start Date/Time` := parse_dt(`Start Date/Time`)]
+dt[, `End Date/Time` := parse_dt(`End Date/Time`)]
+
+# If end is missing, set to start
+dt[is.na(`End Date/Time`) & !is.na(`Start Date/Time`), `End Date/Time` := `Start Date/Time`]
+
+# Filter to date range (keep rows that overlap the window)
+dt <- dt[!is.na(`Start Date/Time`)]
+dt[, start_date := as.IDate(`Start Date/Time`)]
+dt[, end_date := as.IDate(`End Date/Time`)]
+dt <- dt[start_date <= max_date & end_date >= min_date]
+dt[, c("start_date", "end_date") := NULL]
+
+# Drop columns that are entirely NA or empty strings
+nonempty_cols <- names(dt)[
+  vapply(
+    dt,
+    function(x) {
+      if (is.character(x)) {
+        any(!is.na(x) & trimws(x) != "")
+      } else {
+        any(!is.na(x))
+      }
+    },
+    logical(1)
+  )
+]
+dt <- dt[, ..nonempty_cols]
+
+# Write cleaned dataset
+fwrite(dt, output_path)
+```

@@ -1,0 +1,76 @@
+---
+title: "Clean PLUTO: Core + Land Use + Zoning"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  install.packages("data.table")
+}
+library(data.table)
+```
+
+```{r}
+# Paths
+input_path <- "Datasets/Primary_Land_Use_Tax_Lot_Output_(PLUTO)_20260121.csv"
+output_path <- "Datasets/Clean/Primary_Land_Use_Tax_Lot_Output_PLUTO_core_landuse_zoning.csv"
+
+# Core join / spatial keys
+core_cols <- c(
+  "borough", "borocode", "Tax block", "Tax lot", "BBL",
+  "xcoord", "ycoord", "latitude", "longitude",
+  "policeprct", "council district", "community board",
+  "bct2020", "bctcb2020", "census tract 2010", "tract2010",
+  "postcode"
+)
+
+# Land use / built environment
+landuse_cols <- c(
+  "landuse", "bldgclass",
+  "lotarea", "bldgarea", "comarea", "resarea", "officearea",
+  "retailarea", "garagearea", "strgearea", "factryarea", "otherarea",
+  "numbldgs", "numfloors", "unitsres", "unitstotal",
+  "yearbuilt", "yearalter1", "yearalter2",
+  "builtfar", "residfar", "commfar", "facilfar"
+)
+
+# Zoning
+zoning_cols <- c(
+  "zonedist1", "zonedist2", "zonedist3", "zonedist4",
+  "overlay1", "overlay2",
+  "spdist1", "spdist2", "spdist3",
+  "ltdheight", "splitzone"
+)
+
+# Keep geometry for point-in-polygon joins later
+keep_cols <- unique(c(core_cols, landuse_cols, zoning_cols, "geom"))
+
+# Read just the needed columns (robust to minor schema changes)
+dt <- fread(input_path)
+missing_cols <- setdiff(keep_cols, names(dt))
+if (length(missing_cols) > 0) {
+  warning("Missing columns in source file: ", paste(missing_cols, collapse = ", "))
+}
+
+keep_present <- intersect(keep_cols, names(dt))
+clean_dt <- dt[, ..keep_present]
+
+# Drop columns that are entirely NA or empty strings
+nonempty_cols <- names(clean_dt)[
+  vapply(
+    clean_dt,
+    function(x) {
+      if (is.character(x)) {
+        any(!is.na(x) & trimws(x) != "")
+      } else {
+        any(!is.na(x))
+      }
+    },
+    logical(1)
+  )
+]
+clean_dt <- clean_dt[, ..nonempty_cols]
+
+# Write cleaned dataset
+fwrite(clean_dt, output_path)
+```

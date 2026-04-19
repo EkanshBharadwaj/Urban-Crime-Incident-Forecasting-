@@ -1,0 +1,129 @@
+---
+title: "Clean Weather (with Discomfort Index)"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) {
+  install.packages("data.table")
+}
+if (!requireNamespace("readxl", quietly = TRUE)) {
+  install.packages("readxl")
+}
+library(data.table)
+library(readxl)
+```
+
+```{r}
+# Paths
+input_path <- "Datasets/weather.xls"
+output_path <- "Datasets/Clean/Weather_Clean_Daily.csv"
+
+# Date filter window aligned to complaints data
+min_date <- as.IDate("2006-01-01")
+max_date <- as.IDate("2024-12-31")
+
+# Try readxl first; if it fails, fall back to Excel COM via PowerShell
+read_weather <- function(path) {
+  dt <- NULL
+  dt <- tryCatch({
+    raw <- read_excel(path, col_names = FALSE)
+    as.data.table(raw)
+  }, error = function(e) NULL)
+
+  if (is.null(dt)) {
+    # Fallback: export to CSV using Excel COM and read with fread
+    csv_tmp <- file.path(tempdir(), "weather_tmp.csv")
+    src <- normalizePath(path, winslash = "\\", mustWork = TRUE)
+    dst <- normalizePath(csv_tmp, winslash = "\\", mustWork = FALSE)
+    ps <- sprintf(
+      "$excel = New-Object -ComObject Excel.Application; " %+%
+        "$excel.Visible = $false; " %+%
+        "$wb = $excel.Workbooks.Open('%s'); " %+%
+        "$wb.SaveAs('%s', 6); " %+%
+        "$wb.Close($false); " %+%
+        "$excel.Quit();",
+      src,
+      dst
+    )
+    system2("powershell", args = c("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps))
+    dt <- fread(csv_tmp, header = FALSE, encoding = "UTF-8", na.strings = c("", "NA"))
+  }
+  dt
+}
+
+`%+%` <- function(a, b) paste0(a, b)
+
+raw_dt <- read_weather(input_path)
+
+# Locate header row (starts with "Local time in ...")
+header_row <- which(grepl("^Local time", raw_dt[[1]]))[1]
+if (is.na(header_row)) stop("Could not find header row in weather file.")
+
+col_names <- as.character(unlist(raw_dt[header_row]))
+dt <- raw_dt[(header_row + 1):.N]
+setnames(dt, col_names)
+
+# Drop completely empty columns
+dt <- dt[, which(!is.na(names(dt)) & trimws(names(dt)) != ""), with = FALSE]
+
+# Rename key columns for easier handling
+old_time_col <- names(dt)[1]
+setnames(dt, old_time_col, "local_time")
+
+# Parse datetime (format like "21.01.2026 22:00")
+dt[, local_time := as.POSIXct(local_time, format = "%d.%m.%Y %H:%M", tz = "America/New_York")]
+dt <- dt[!is.na(local_time)]
+
+# Helper: coerce to numeric safely
+num_clean <- function(x) {
+  x <- gsub(",", ".", as.character(x))
+  x <- gsub("[^0-9\\.-]", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+# Core inputs for DI
+if ("T" %in% names(dt)) dt[, T := num_clean(T)] else stop("Missing T (air temp).")
+if ("U" %in% names(dt)) dt[, U := num_clean(U)] else stop("Missing U (relative humidity).")
+if ("Ff" %in% names(dt)) dt[, Ff := num_clean(Ff)] else dt[, Ff := NA_real_]
+
+# Compute DI per observation (Appendix A)
+RH <- dt$U
+T <- dt$T
+V <- dt$Ff
+
+e <- (RH / 100) * 6.105 * exp((17.2 * T) / (237.7 + T))
+AT <- 1.07 * T + 0.2 * e - 0.65 * V - 2.7
+
+a <- 0.151977
+b <- 8.313659
+c <- 1.676311
+d <- 0.00391838
+ecoef <- 0.023101
+f <- 4.68035
+
+Tw <- AT * atan(a * RH + b) + atan(AT + RH) - atan(RH - c) + d * RH^2 * atan(ecoef * RH) - f
+DI <- 0.5 * Tw + 0.5 * AT
+
+dt[, `:=`(AT = AT, Tw = Tw, DI = DI)]
+
+# Aggregate to daily features (compatible with daily crime data)
+dt[, date := as.IDate(local_time)]
+daily <- dt[, .(
+  t_mean = mean(T, na.rm = TRUE),
+  t_min = min(T, na.rm = TRUE),
+  t_max = max(T, na.rm = TRUE),
+  rh_mean = mean(U, na.rm = TRUE),
+  wind_mean = mean(Ff, na.rm = TRUE),
+  at_mean = mean(AT, na.rm = TRUE),
+  tw_mean = mean(Tw, na.rm = TRUE),
+  di_mean = mean(DI, na.rm = TRUE),
+  obs_count = .N
+), by = date]
+
+# Filter to target date range
+daily <- daily[date >= min_date & date <= max_date]
+
+# Write cleaned dataset
+fwrite(daily, output_path)
+```

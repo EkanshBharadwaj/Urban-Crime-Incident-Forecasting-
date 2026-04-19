@@ -1,0 +1,152 @@
+---
+title: "Parent Paper Replication Dataset Builder"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
+if (!requireNamespace("lubridate", quietly = TRUE)) install.packages("lubridate")
+
+library(data.table)
+library(lubridate)
+```
+
+```{r}
+# ---------------------------
+# Parameters (edit as needed)
+# ---------------------------
+input_point_path <- "Datasets/Clean/Crime_Enriched_PointLevel.csv"
+output_replication_path <- "Datasets/Clean/Crime_Replication_PrecinctDaily.csv"
+
+# Date window for replication (use NULL to keep full range in data)
+start_date <- as.Date("2006-01-01")
+end_date <- as.Date("2024-12-31")
+
+# Spatial unit column in point-level file
+precinct_col <- "precinct"  # uses addr_pct_cd cast to character in merge_datasets_v2.Rmd
+
+# Crime type mapping (edit to match NYC offense taxonomy)
+# Each element is a regex matched against ofns_desc or pd_desc.
+crime_type_patterns <- list(
+  ASSAULT = "ASSAULT|HARRASSMENT|HARASSMENT|FELONY ASSAULT|OFFENSES AGAINST THE PERSON",
+  ROBBERY = "ROBBERY",
+  THEFT = "PETIT LARCENY|GRAND LARCENY|LARCENY|THEFT",
+  CRIMINAL_DAMAGE = "CRIMINAL MISCHIEF|CRIMINAL DAMAGE|DAMAGE|VANDAL"
+)
+```
+
+```{r}
+# ---------------------------
+# Load point-level data
+# ---------------------------
+dt <- fread(input_point_path)
+
+# Ensure crime_date is Date and precinct is character
+dt[, crime_date := as.Date(crime_date)]
+dt[, precinct := as.character(get(precinct_col))]
+
+# Drop rows without geo (align with parent paper)
+dt <- dt[!is.na(latitude) & !is.na(longitude)]
+
+# Apply date window if set
+if (!is.na(start_date)) dt <- dt[crime_date >= start_date]
+if (!is.na(end_date)) dt <- dt[crime_date <= end_date]
+
+# Derive crime type from ofns_desc or pd_desc
+dt[, crime_type := NA_character_]
+for (nm in names(crime_type_patterns)) {
+  pat <- crime_type_patterns[[nm]]
+  dt[is.na(crime_type) & (grepl(pat, ofns_desc, ignore.case = TRUE) |
+                            grepl(pat, pd_desc, ignore.case = TRUE)),
+     crime_type := nm]
+}
+
+# Keep only mapped crime types (parent paper uses 4 types)
+dt <- dt[!is.na(crime_type)]
+```
+
+```{r}
+# ---------------------------
+# Aggregate to precinct-day-crime_type
+# ---------------------------
+agg <- dt[, .(crime_count = .N), by = .(precinct, crime_date, crime_type)]
+
+# Build full date grid per precinct and crime_type; fill missing with 0
+all_dates <- seq(min(agg$crime_date), max(agg$crime_date), by = "day")
+grid <- CJ(
+  precinct = unique(agg$precinct),
+  crime_type = unique(agg$crime_type),
+  crime_date = all_dates,
+  unique = TRUE
+)
+setkey(grid, precinct, crime_type, crime_date)
+setkey(agg, precinct, crime_type, crime_date)
+agg <- agg[grid]
+agg[is.na(crime_count), crime_count := 0L]
+
+# Add calendar features
+agg[, weekday := wday(crime_date, week_start = 1)]
+agg[, month := month(crime_date)]
+
+# Weekend flag (1 weekend, 0 weekday)
+agg[, weekend := as.integer(weekday %in% c(6, 7))]
+```
+
+```{r}
+# ---------------------------
+# Join holidays + weather (from point-level daily fields)
+# ---------------------------
+# Use daily values from point-level file (take first non-NA for each date)
+daily_features <- unique(dt[, .(
+  crime_date,
+  t_mean, t_min, t_max, rh_mean, wind_mean,
+  at_mean, tw_mean, di_mean, obs_count,
+  weekend, holiday, is_christian_holiday, is_islamic_holiday,
+  is_jewish_holiday, is_hindu_holiday
+)])
+
+setkey(daily_features, crime_date)
+setkey(agg, crime_date)
+agg <- daily_features[agg]
+
+# Compute vapor pressure e from T and RH (if available)
+if ("t_mean" %in% names(agg) && "rh_mean" %in% names(agg)) {
+  agg[, e_mean := (rh_mean / 100) * 6.105 * exp((17.2 * t_mean) / (237.7 + t_mean))]
+}
+```
+
+```{r}
+# ---------------------------
+# Historical averages (parent paper features)
+# ---------------------------
+# Average crime count on weekdays/weekends for each precinct and crime_type
+agg[, weekday_avg := mean(crime_count[weekend == 0], na.rm = TRUE),
+    by = .(precinct, crime_type)]
+agg[, weekend_avg := mean(crime_count[weekend == 1], na.rm = TRUE),
+    by = .(precinct, crime_type)]
+
+# Monthly average for each precinct, crime_type, and month
+agg[, month_avg := mean(crime_count, na.rm = TRUE),
+    by = .(precinct, crime_type, month)]
+
+# Previous day count (lag 1)
+setorder(agg, precinct, crime_type, crime_date)
+agg[, count_avg := shift(crime_count, 1, type = "lag"),
+    by = .(precinct, crime_type)]
+agg[is.na(count_avg), count_avg := 0L]
+```
+
+```{r}
+# ---------------------------
+# Output replication dataset
+# ---------------------------
+fwrite(agg, output_replication_path)
+cat("Wrote replication dataset:", output_replication_path, "\n")
+```
+
+```{r}
+data <- read.csv("C:\\Users\\ekans\\Desktop\\DS340W\\Datasets\\Clean\\Crime_Enriched_PointLevel.csv", nrows = 10)
+
+print(data)
+```
+
